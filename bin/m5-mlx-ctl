@@ -1,0 +1,751 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_DIR="${M5_MLX_REPO_DIR:-$(cd "${SCRIPT_DIR}/.." && pwd)}"
+
+M5_MLX_HOME="${M5_MLX_HOME:-$HOME/.local/share/m5-mlx}"
+M5_MLX_PORT="${M5_MLX_PORT:-8080}"
+M5_MLX_UPSTREAM_PORT="${M5_MLX_UPSTREAM_PORT:-8081}"
+
+SERVER_SCRIPT="${REPO_DIR}/server/m5_mlx_server.py"
+PYTHON_BIN="${M5_MLX_HOME}/mlx-env/bin/python"
+LOG_DIR="${M5_MLX_HOME}/logs"
+if [ "$M5_MLX_PORT" = "8080" ]; then
+  PID_FILE="${M5_MLX_HOME}/m5-mlx-server.pid"
+  LOG_FILE="${LOG_DIR}/m5-mlx-server.log"
+else
+  PID_FILE="${M5_MLX_HOME}/m5-mlx-server-${M5_MLX_PORT}.pid"
+  LOG_FILE="${LOG_DIR}/m5-mlx-server-${M5_MLX_PORT}.log"
+fi
+PROFILE_ENV="${M5_MLX_HOME}/active_profile.env"
+
+PLIST_TEMPLATE="${REPO_DIR}/launchd/com.community.m5-mlx-server.plist.template"
+PLIST_FILE="${HOME}/Library/LaunchAgents/com.community.m5-mlx-server.plist"
+SERVICE_LABEL="com.community.m5-mlx-server"
+GUI_DOMAIN="gui/$(id -u)"
+
+usage() {
+  cat >&2 <<EOF
+Usage: $(basename "$0") <command> [args]
+
+Commands:
+  start                    Start m5-mlx-server using active profile (default: inkling2)
+  stop                     Stop m5-mlx-server and any upstream omlx/llama-server processes
+  restart                  Stop then start m5-mlx-server
+  switch <profile>         Switch profile: inkling2 | inkling2-omlx | inkling2-gguf | qwen3.6
+  status                   Show server health, active profile, and LaunchAgent status
+  logs [lines]             Tail server logs (default: 50 lines)
+  doctor                   Check Apple Silicon hardware, wired limit, venvs, binaries, and models
+  install-launchagent      Render and install LaunchAgent plist at ~/Library/LaunchAgents
+  uninstall-launchagent    Bootout and remove LaunchAgent plist
+EOF
+}
+
+get_port_pid() {
+  local p="${1:-$M5_MLX_PORT}"
+  /usr/sbin/lsof -ti tcp:"${p}" -sTCP:LISTEN 2>/dev/null | head -n 1 || true
+}
+
+resolve_llama_bin() {
+  local candidates=(
+    "${M5_MLX_HOME}/bin/llama-server"
+    "${M5_MLX_HOME}/bin/unsloth-llama-cpp/llama-server"
+    "${M5_MLX_HOME}/bin/unsloth-llama-cpp/llama-b12588-mix-c0c3de8/llama-server"
+    "${M5_MLX_HOME}/llama.cpp/llama-server"
+  )
+  local cand
+  for cand in "${candidates[@]}"; do
+    if [ -x "$cand" ]; then
+      printf '%s\n' "$cand"
+      return 0
+    fi
+  done
+  if [ -d "${M5_MLX_HOME}/bin/unsloth-llama-cpp" ]; then
+    local discovered
+    discovered="$(find "${M5_MLX_HOME}/bin/unsloth-llama-cpp" -maxdepth 4 -type f -name 'llama-server' 2>/dev/null | head -n 1 || true)"
+    if [ -n "$discovered" ] && [ -x "$discovered" ]; then
+      printf '%s\n' "$discovered"
+      return 0
+    fi
+  fi
+  local from_path
+  from_path="$(command -v llama-server 2>/dev/null || true)"
+  if [ -n "$from_path" ]; then
+    printf '%s\n' "$from_path"
+    return 0
+  fi
+  printf '%s\n' "${M5_MLX_HOME}/bin/llama-server"
+}
+
+resolve_qwen_dir() {
+  local ud_dir="${M5_MLX_HOME}/models/Qwen3.6-35B-A3B-UD-MLX-3bit"
+  local moe_dir="${M5_MLX_HOME}/models/Qwen3.6-35B-A3B-NVFP4-MLX-3bit-MoE"
+  if [ -d "$ud_dir" ]; then
+    printf '%s\n' "$ud_dir"
+  elif [ -d "$moe_dir" ]; then
+    printf '%s\n' "$moe_dir"
+  else
+    printf '%s\n' "$ud_dir"
+  fi
+}
+
+clear_profile_vars() {
+  M5_MLX_PROFILE=""
+  M5_MLX_BACKEND=""
+  M5_MLX_MODEL_ID=""
+  M5_MLX_CONTEXT_LENGTH="131072"
+  M5_MLX_SSE_KEEPALIVE_S="5.0"
+  M5_MLX_WIRED_LIMIT_MB="0"
+  M5_MLX_MODEL_DIR=""
+  M5_MLX_KV_BITS=""
+  M5_MLX_KV_GROUP_SIZE=""
+  M5_MLX_PREFILL_STEP_SIZE=""
+  M5_MLX_KEEPWARM_INTERVAL_S=""
+  M5_MLX_OMLX_BIN=""
+  M5_MLX_OMLX_MODEL_DIR=""
+  M5_MLX_OMLX_DATA_DIR=""
+  M5_MLX_OMLX_SSD_CACHE_DIR=""
+  M5_MLX_OMLX_PORT=""
+  M5_MLX_OMLX_MEMORY_GUARD_GB=""
+  M5_MLX_OMLX_HOT_CACHE=""
+  M5_MLX_OMLX_MAX_CONCURRENT=""
+  M5_MLX_OVERFLOW_TOKENS=""
+  M5_MLX_RESTORE_IDLE_S=""
+  M5_MLX_OVERFLOW_LLAMA_BIN=""
+  M5_MLX_OVERFLOW_MODEL_FILE=""
+  M5_MLX_LLAMA_SERVER_BIN=""
+  M5_MLX_MODEL_FILE=""
+  M5_MLX_DRAFT_MODEL_FILE=""
+  M5_MLX_SPEC_DRAFT_MAX=""
+  M5_MLX_KV_CACHE_TYPE=""
+  M5_MLX_LLAMA_PORT=""
+  M5_MLX_LLAMA_THREADS=""
+}
+
+apply_preset() {
+  local target="${1:-}"
+  clear_profile_vars
+  case "$target" in
+    inkling2|inkling2-omlx)
+      M5_MLX_PROFILE="$target"
+      M5_MLX_BACKEND="omlx"
+      M5_MLX_MODEL_ID="inkling-2-mini-oq3e-mtp"
+      M5_MLX_CONTEXT_LENGTH="131072"
+      M5_MLX_WIRED_LIMIT_MB="0"
+      M5_MLX_OMLX_BIN="${M5_MLX_HOME}/omlx-env/bin/omlx"
+      M5_MLX_OMLX_MODEL_DIR="${M5_MLX_HOME}/omlx-models"
+      M5_MLX_OMLX_DATA_DIR="${M5_MLX_HOME}/omlx-data"
+      M5_MLX_OMLX_SSD_CACHE_DIR="${M5_MLX_HOME}/omlx-ssd-cache"
+      M5_MLX_OMLX_PORT="${M5_MLX_UPSTREAM_PORT}"
+      M5_MLX_OMLX_MEMORY_GUARD_GB="20.0"
+      M5_MLX_OMLX_HOT_CACHE="0"
+      M5_MLX_OMLX_MAX_CONCURRENT="1"
+      # Automatic 128K overflow to Unsloth llama-server
+      M5_MLX_OVERFLOW_TOKENS="16500"
+      M5_MLX_RESTORE_IDLE_S="300"
+      M5_MLX_OVERFLOW_LLAMA_BIN="$(resolve_llama_bin)"
+      M5_MLX_OVERFLOW_MODEL_FILE="${M5_MLX_HOME}/models/Inkling-2-Mini-GGUF/Inkling-2-Mini-UD-Q3_K_XL.gguf"
+      ;;
+    inkling2-gguf)
+      M5_MLX_PROFILE="inkling2-gguf"
+      M5_MLX_BACKEND="llama-cpp"
+      M5_MLX_MODEL_ID="inkling-2-mini-ud-q3-k-xl"
+      M5_MLX_CONTEXT_LENGTH="131072"
+      M5_MLX_KV_CACHE_TYPE="q4_0"
+      M5_MLX_LLAMA_THREADS="6"
+      M5_MLX_SPEC_DRAFT_MAX="0"
+      M5_MLX_LLAMA_SERVER_BIN="$(resolve_llama_bin)"
+      M5_MLX_MODEL_FILE="${M5_MLX_HOME}/models/Inkling-2-Mini-GGUF/Inkling-2-Mini-UD-Q3_K_XL.gguf"
+      M5_MLX_DRAFT_MODEL_FILE="${M5_MLX_HOME}/models/Inkling-2-Mini-GGUF/dspark-Inkling-2-Mini-Q8_0.gguf"
+      M5_MLX_LLAMA_PORT="${M5_MLX_UPSTREAM_PORT}"
+      M5_MLX_WIRED_LIMIT_MB="0"
+      ;;
+    qwen3.6)
+      M5_MLX_PROFILE="qwen3.6"
+      M5_MLX_BACKEND="mlx"
+      M5_MLX_MODEL_ID="qwen3.6-35b-a3b-3bit-mlx"
+      M5_MLX_CONTEXT_LENGTH="131072"
+      M5_MLX_KV_BITS="4"
+      M5_MLX_KV_GROUP_SIZE="64"
+      M5_MLX_PREFILL_STEP_SIZE="256"
+      M5_MLX_WIRED_LIMIT_MB="6144"
+      M5_MLX_KEEPWARM_INTERVAL_S="60"
+      M5_MLX_MODEL_DIR="$(resolve_qwen_dir)"
+      ;;
+    *)
+      echo "Usage: $(basename "$0") switch {inkling2|inkling2-omlx|inkling2-gguf|qwen3.6}" >&2
+      return 1
+      ;;
+  esac
+}
+
+load_active_profile() {
+  if [ -f "$PROFILE_ENV" ]; then
+    clear_profile_vars
+    local saved_home="$M5_MLX_HOME"
+    local saved_port="$M5_MLX_PORT"
+    local saved_upstream="$M5_MLX_UPSTREAM_PORT"
+    set -a
+    # shellcheck disable=SC1090
+    source "$PROFILE_ENV"
+    set +a
+    M5_MLX_HOME="$saved_home"
+    M5_MLX_PORT="$saved_port"
+    M5_MLX_UPSTREAM_PORT="$saved_upstream"
+    if [ -z "${M5_MLX_BACKEND:-}" ]; then
+      apply_preset "inkling2"
+    fi
+  else
+    apply_preset "inkling2"
+  fi
+}
+
+write_active_profile_env() {
+  mkdir -p "$M5_MLX_HOME"
+  local tmp_file
+  tmp_file="$(mktemp "${M5_MLX_HOME}/.active_profile.XXXXXX")"
+  {
+    printf 'M5_MLX_PROFILE=%q\n' "$M5_MLX_PROFILE"
+    printf 'M5_MLX_BACKEND=%q\n' "$M5_MLX_BACKEND"
+    printf 'M5_MLX_MODEL_ID=%q\n' "$M5_MLX_MODEL_ID"
+    printf 'M5_MLX_CONTEXT_LENGTH=%q\n' "$M5_MLX_CONTEXT_LENGTH"
+    printf 'M5_MLX_SSE_KEEPALIVE_S=%q\n' "$M5_MLX_SSE_KEEPALIVE_S"
+    printf 'M5_MLX_WIRED_LIMIT_MB=%q\n' "$M5_MLX_WIRED_LIMIT_MB"
+    printf 'M5_MLX_PORT=%q\n' "$M5_MLX_PORT"
+    printf 'M5_MLX_UPSTREAM_PORT=%q\n' "$M5_MLX_UPSTREAM_PORT"
+    [ -n "$M5_MLX_MODEL_DIR" ] && printf 'M5_MLX_MODEL_DIR=%q\n' "$M5_MLX_MODEL_DIR"
+    [ -n "$M5_MLX_KV_BITS" ] && printf 'M5_MLX_KV_BITS=%q\n' "$M5_MLX_KV_BITS"
+    [ -n "$M5_MLX_KV_GROUP_SIZE" ] && printf 'M5_MLX_KV_GROUP_SIZE=%q\n' "$M5_MLX_KV_GROUP_SIZE"
+    [ -n "$M5_MLX_PREFILL_STEP_SIZE" ] && printf 'M5_MLX_PREFILL_STEP_SIZE=%q\n' "$M5_MLX_PREFILL_STEP_SIZE"
+    [ -n "$M5_MLX_KEEPWARM_INTERVAL_S" ] && printf 'M5_MLX_KEEPWARM_INTERVAL_S=%q\n' "$M5_MLX_KEEPWARM_INTERVAL_S"
+    [ -n "$M5_MLX_OMLX_BIN" ] && printf 'M5_MLX_OMLX_BIN=%q\n' "$M5_MLX_OMLX_BIN"
+    [ -n "$M5_MLX_OMLX_MODEL_DIR" ] && printf 'M5_MLX_OMLX_MODEL_DIR=%q\n' "$M5_MLX_OMLX_MODEL_DIR"
+    [ -n "$M5_MLX_OMLX_DATA_DIR" ] && printf 'M5_MLX_OMLX_DATA_DIR=%q\n' "$M5_MLX_OMLX_DATA_DIR"
+    [ -n "$M5_MLX_OMLX_SSD_CACHE_DIR" ] && printf 'M5_MLX_OMLX_SSD_CACHE_DIR=%q\n' "$M5_MLX_OMLX_SSD_CACHE_DIR"
+    [ -n "$M5_MLX_OMLX_PORT" ] && printf 'M5_MLX_OMLX_PORT=%q\n' "$M5_MLX_OMLX_PORT"
+    [ -n "$M5_MLX_OMLX_MEMORY_GUARD_GB" ] && printf 'M5_MLX_OMLX_MEMORY_GUARD_GB=%q\n' "$M5_MLX_OMLX_MEMORY_GUARD_GB"
+    [ -n "$M5_MLX_OMLX_HOT_CACHE" ] && printf 'M5_MLX_OMLX_HOT_CACHE=%q\n' "$M5_MLX_OMLX_HOT_CACHE"
+    [ -n "$M5_MLX_OMLX_MAX_CONCURRENT" ] && printf 'M5_MLX_OMLX_MAX_CONCURRENT=%q\n' "$M5_MLX_OMLX_MAX_CONCURRENT"
+    [ -n "$M5_MLX_OVERFLOW_TOKENS" ] && printf 'M5_MLX_OVERFLOW_TOKENS=%q\n' "$M5_MLX_OVERFLOW_TOKENS"
+    [ -n "$M5_MLX_RESTORE_IDLE_S" ] && printf 'M5_MLX_RESTORE_IDLE_S=%q\n' "$M5_MLX_RESTORE_IDLE_S"
+    [ -n "$M5_MLX_OVERFLOW_LLAMA_BIN" ] && printf 'M5_MLX_OVERFLOW_LLAMA_BIN=%q\n' "$M5_MLX_OVERFLOW_LLAMA_BIN"
+    [ -n "$M5_MLX_OVERFLOW_MODEL_FILE" ] && printf 'M5_MLX_OVERFLOW_MODEL_FILE=%q\n' "$M5_MLX_OVERFLOW_MODEL_FILE"
+    [ -n "$M5_MLX_LLAMA_SERVER_BIN" ] && printf 'M5_MLX_LLAMA_SERVER_BIN=%q\n' "$M5_MLX_LLAMA_SERVER_BIN"
+    [ -n "$M5_MLX_MODEL_FILE" ] && printf 'M5_MLX_MODEL_FILE=%q\n' "$M5_MLX_MODEL_FILE"
+    [ -n "$M5_MLX_DRAFT_MODEL_FILE" ] && printf 'M5_MLX_DRAFT_MODEL_FILE=%q\n' "$M5_MLX_DRAFT_MODEL_FILE"
+    [ -n "$M5_MLX_SPEC_DRAFT_MAX" ] && printf 'M5_MLX_SPEC_DRAFT_MAX=%q\n' "$M5_MLX_SPEC_DRAFT_MAX"
+    [ -n "$M5_MLX_KV_CACHE_TYPE" ] && printf 'M5_MLX_KV_CACHE_TYPE=%q\n' "$M5_MLX_KV_CACHE_TYPE"
+    [ -n "$M5_MLX_LLAMA_PORT" ] && printf 'M5_MLX_LLAMA_PORT=%q\n' "$M5_MLX_LLAMA_PORT"
+    [ -n "$M5_MLX_LLAMA_THREADS" ] && printf 'M5_MLX_LLAMA_THREADS=%q\n' "$M5_MLX_LLAMA_THREADS"
+  } > "$tmp_file"
+  mv -f "$tmp_file" "$PROFILE_ENV"
+}
+
+export_active_profile_env() {
+  export M5_MLX_HOME M5_MLX_REPO_DIR="$REPO_DIR" M5_MLX_PORT M5_MLX_UPSTREAM_PORT
+  local _v
+  for _v in \
+    M5_MLX_PROFILE M5_MLX_BACKEND M5_MLX_MODEL_ID M5_MLX_CONTEXT_LENGTH \
+    M5_MLX_SSE_KEEPALIVE_S M5_MLX_WIRED_LIMIT_MB \
+    M5_MLX_MODEL_DIR M5_MLX_KV_BITS M5_MLX_KV_GROUP_SIZE M5_MLX_PREFILL_STEP_SIZE M5_MLX_KEEPWARM_INTERVAL_S \
+    M5_MLX_OMLX_BIN M5_MLX_OMLX_MODEL_DIR M5_MLX_OMLX_DATA_DIR M5_MLX_OMLX_SSD_CACHE_DIR M5_MLX_OMLX_PORT \
+    M5_MLX_OMLX_MEMORY_GUARD_GB M5_MLX_OMLX_HOT_CACHE M5_MLX_OMLX_MAX_CONCURRENT \
+    M5_MLX_OVERFLOW_TOKENS M5_MLX_RESTORE_IDLE_S M5_MLX_OVERFLOW_LLAMA_BIN M5_MLX_OVERFLOW_MODEL_FILE \
+    M5_MLX_LLAMA_SERVER_BIN M5_MLX_MODEL_FILE M5_MLX_DRAFT_MODEL_FILE M5_MLX_SPEC_DRAFT_MAX \
+    M5_MLX_KV_CACHE_TYPE M5_MLX_LLAMA_PORT M5_MLX_LLAMA_THREADS
+  do
+    if [ -n "${!_v:-}" ]; then
+      export "${_v}=${!_v}"
+    else
+      unset "$_v" 2>/dev/null || true
+    fi
+  done
+}
+
+plist_set_env() {
+  local key="$1"
+  local val="$2"
+  /usr/libexec/PlistBuddy -c "Set :EnvironmentVariables:${key} ${val}" "$PLIST_FILE" 2>/dev/null || \
+    /usr/libexec/PlistBuddy -c "Add :EnvironmentVariables:${key} string ${val}" "$PLIST_FILE"
+}
+
+plist_del_env() {
+  local key="$1"
+  /usr/libexec/PlistBuddy -c "Delete :EnvironmentVariables:${key}" "$PLIST_FILE" 2>/dev/null || true
+}
+
+plist_rebuild_args() {
+  /usr/libexec/PlistBuddy -c "Delete :ProgramArguments" "$PLIST_FILE" 2>/dev/null || true
+  /usr/libexec/PlistBuddy -c "Add :ProgramArguments array" "$PLIST_FILE"
+  local idx=0
+  local arg
+  for arg in "$@"; do
+    /usr/libexec/PlistBuddy -c "Add :ProgramArguments:${idx} string ${arg}" "$PLIST_FILE"
+    idx=$((idx + 1))
+  done
+}
+
+build_server_args() {
+  SERVER_ARGS=(
+    "$PYTHON_BIN" "$SERVER_SCRIPT"
+    --backend "$M5_MLX_BACKEND"
+    --model-id "$M5_MLX_MODEL_ID"
+    --context-length "$M5_MLX_CONTEXT_LENGTH"
+    --port "$M5_MLX_PORT"
+  )
+  if [ "$M5_MLX_BACKEND" = "omlx" ]; then
+    SERVER_ARGS+=(
+      --omlx-bin "$M5_MLX_OMLX_BIN"
+      --omlx-model-dir "$M5_MLX_OMLX_MODEL_DIR"
+      --omlx-data-dir "$M5_MLX_OMLX_DATA_DIR"
+      --omlx-ssd-cache-dir "$M5_MLX_OMLX_SSD_CACHE_DIR"
+      --omlx-port "${M5_MLX_OMLX_PORT:-$M5_MLX_UPSTREAM_PORT}"
+    )
+  elif [ "$M5_MLX_BACKEND" = "llama-cpp" ]; then
+    SERVER_ARGS+=(
+      --llama-server-bin "$M5_MLX_LLAMA_SERVER_BIN"
+      --model-file "$M5_MLX_MODEL_FILE"
+      --spec-draft-max "${M5_MLX_SPEC_DRAFT_MAX:-0}"
+      --kv-cache-type "${M5_MLX_KV_CACHE_TYPE:-q4_0}"
+      --llama-port "${M5_MLX_LLAMA_PORT:-$M5_MLX_UPSTREAM_PORT}"
+      --threads "${M5_MLX_LLAMA_THREADS:-6}"
+    )
+    if [ -n "${M5_MLX_DRAFT_MODEL_FILE:-}" ]; then
+      SERVER_ARGS+=(--draft-model-file "$M5_MLX_DRAFT_MODEL_FILE")
+    fi
+  else
+    SERVER_ARGS+=(
+      --model-dir "$M5_MLX_MODEL_DIR"
+      --kv-bits "${M5_MLX_KV_BITS:-4}"
+      --kv-group-size "${M5_MLX_KV_GROUP_SIZE:-64}"
+      --prefill-step-size "${M5_MLX_PREFILL_STEP_SIZE:-256}"
+    )
+  fi
+}
+
+sync_launchagent_plist() {
+  [ -f "$PLIST_FILE" ] || return 0
+
+  plist_set_env "M5_MLX_HOME" "$M5_MLX_HOME"
+  plist_set_env "M5_MLX_REPO_DIR" "$REPO_DIR"
+  plist_set_env "M5_MLX_BACKEND" "$M5_MLX_BACKEND"
+  plist_set_env "M5_MLX_MODEL_ID" "$M5_MLX_MODEL_ID"
+  plist_set_env "M5_MLX_CONTEXT_LENGTH" "$M5_MLX_CONTEXT_LENGTH"
+  plist_set_env "M5_MLX_SSE_KEEPALIVE_S" "$M5_MLX_SSE_KEEPALIVE_S"
+  plist_set_env "M5_MLX_PORT" "$M5_MLX_PORT"
+  plist_set_env "M5_MLX_UPSTREAM_PORT" "$M5_MLX_UPSTREAM_PORT"
+  plist_set_env "M5_MLX_WIRED_LIMIT_MB" "$M5_MLX_WIRED_LIMIT_MB"
+
+  local arg_vars=(
+    M5_MLX_OMLX_BIN M5_MLX_OMLX_MODEL_DIR M5_MLX_OMLX_DATA_DIR M5_MLX_OMLX_SSD_CACHE_DIR M5_MLX_OMLX_PORT
+    M5_MLX_OMLX_MEMORY_GUARD_GB M5_MLX_OMLX_HOT_CACHE M5_MLX_OMLX_MAX_CONCURRENT
+    M5_MLX_OVERFLOW_TOKENS M5_MLX_RESTORE_IDLE_S M5_MLX_OVERFLOW_LLAMA_BIN M5_MLX_OVERFLOW_MODEL_FILE
+    M5_MLX_LLAMA_SERVER_BIN M5_MLX_MODEL_FILE M5_MLX_DRAFT_MODEL_FILE M5_MLX_SPEC_DRAFT_MAX
+    M5_MLX_KV_CACHE_TYPE M5_MLX_LLAMA_PORT M5_MLX_LLAMA_THREADS
+    M5_MLX_MODEL_DIR M5_MLX_KV_BITS M5_MLX_KV_GROUP_SIZE M5_MLX_PREFILL_STEP_SIZE M5_MLX_KEEPWARM_INTERVAL_S
+  )
+  local k
+  for k in "${arg_vars[@]}"; do
+    local v="${!k:-}"
+    if [ -n "$v" ]; then
+      plist_set_env "$k" "$v"
+    else
+      plist_del_env "$k"
+    fi
+  done
+
+  build_server_args
+  plist_rebuild_args "${SERVER_ARGS[@]}"
+}
+
+plist_matches_port() {
+  [ -f "$PLIST_FILE" ] || return 1
+  local plist_port
+  plist_port="$(/usr/libexec/PlistBuddy -c "Print :EnvironmentVariables:M5_MLX_PORT" "$PLIST_FILE" 2>/dev/null || true)"
+  [ "$plist_port" = "$M5_MLX_PORT" ]
+}
+
+is_m5_port_pid() {
+  local pid="${1:-}"
+  [ -n "$pid" ] || return 1
+  local cmd
+  cmd="$(ps -p "$pid" -o command= 2>/dev/null || true)"
+  case "$cmd" in
+    *m5_mlx_server.py*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+find_port_server_pid() {
+  if [ -f "$PID_FILE" ]; then
+    local fpid
+    fpid="$(cat "$PID_FILE" 2>/dev/null || true)"
+    if [ -n "$fpid" ] && kill -0 "$fpid" 2>/dev/null; then
+      printf '%s\n' "$fpid"
+      return 0
+    fi
+  fi
+  local port_pid
+  port_pid="$(get_port_pid "$M5_MLX_PORT")"
+  if is_m5_port_pid "$port_pid"; then
+    printf '%s\n' "$port_pid"
+    return 0
+  fi
+  local ps_pid
+  ps_pid="$(ps -eo pid=,command= 2>/dev/null | awk -v port="$M5_MLX_PORT" '
+    index($0, "m5_mlx_server.py") > 0 && ($0 ~ ("--port[ =]" port "([[:space:]]|$)")) {
+      print $1; exit
+    }' || true)"
+  if [ -n "$ps_pid" ]; then
+    printf '%s\n' "$ps_pid"
+    return 0
+  fi
+  return 1
+}
+
+is_server_active() {
+  if [ -n "$(find_port_server_pid || true)" ]; then
+    return 0
+  fi
+  if plist_matches_port && launchctl print "${GUI_DOMAIN}/${SERVICE_LABEL}" >/dev/null 2>&1; then
+    local lpid
+    lpid="$(launchctl print "${GUI_DOMAIN}/${SERVICE_LABEL}" 2>/dev/null | awk -F'= ' '/^[[:space:]]*pid = /{print $2; exit}' || true)"
+    [ -n "${lpid:-}" ] && return 0
+  fi
+  return 1
+}
+
+cmd_start() {
+  mkdir -p "$M5_MLX_HOME" "$LOG_DIR"
+  load_active_profile
+
+  if curl -sf --max-time 2 "http://127.0.0.1:${M5_MLX_PORT}/health" >/dev/null 2>&1; then
+    local existing_pid
+    existing_pid="$(get_port_pid "$M5_MLX_PORT")"
+    [ -n "$existing_pid" ] && echo "$existing_pid" > "$PID_FILE"
+    echo "m5-mlx-server already running (PID ${existing_pid:-unknown}) on http://127.0.0.1:${M5_MLX_PORT}/v1"
+    curl -s "http://127.0.0.1:${M5_MLX_PORT}/health"
+    echo ""
+    return 0
+  fi
+
+  if [ ! -x "$PYTHON_BIN" ]; then
+    echo "Missing Python venv at ${PYTHON_BIN}. Run ${REPO_DIR}/install.sh first." >&2
+    return 1
+  fi
+  if [ ! -f "$SERVER_SCRIPT" ]; then
+    echo "Missing server script at ${SERVER_SCRIPT}." >&2
+    return 1
+  fi
+
+  local spawned_pid=""
+  echo "Starting m5-mlx-server (profile=${M5_MLX_PROFILE:-$M5_MLX_BACKEND}, backend=${M5_MLX_BACKEND}) on http://127.0.0.1:${M5_MLX_PORT}/v1 ..."
+  if plist_matches_port; then
+    local launch_pid live_pid
+    launch_pid="$(launchctl print "${GUI_DOMAIN}/${SERVICE_LABEL}" 2>/dev/null | awk -F'= ' '/^[[:space:]]*pid = /{print $2; exit}' || true)"
+    live_pid="$(find_port_server_pid || true)"
+    if [ -n "${launch_pid:-}" ] || [ -n "${live_pid:-}" ]; then
+      echo "m5-mlx-server already starting/running (PID ${launch_pid:-$live_pid}); waiting for /health..."
+    elif launchctl print "${GUI_DOMAIN}/${SERVICE_LABEL}" >/dev/null 2>&1; then
+      launchctl kickstart "${GUI_DOMAIN}/${SERVICE_LABEL}" 2>/dev/null || true
+    else
+      launchctl bootstrap "$GUI_DOMAIN" "$PLIST_FILE" 2>/dev/null || true
+    fi
+  else
+    local live_pid
+    live_pid="$(find_port_server_pid || true)"
+    if [ -n "${live_pid:-}" ]; then
+      echo "m5-mlx-server already starting/running on port ${M5_MLX_PORT} (PID ${live_pid}); waiting for /health..."
+    else
+      export_active_profile_env
+      build_server_args
+      nohup "${SERVER_ARGS[@]}" > "$LOG_FILE" 2>&1 &
+      spawned_pid="$!"
+      echo "$spawned_pid" > "$PID_FILE"
+    fi
+  fi
+
+  local i server_pid
+  for i in $(seq 1 240); do
+    if curl -sf --max-time 2 "http://127.0.0.1:${M5_MLX_PORT}/health" >/dev/null 2>&1; then
+      server_pid="$(get_port_pid "$M5_MLX_PORT")"
+      [ -n "$server_pid" ] && echo "$server_pid" > "$PID_FILE"
+      echo "m5-mlx-server ready (PID ${server_pid:-unknown})."
+      curl -s "http://127.0.0.1:${M5_MLX_PORT}/health"
+      echo ""
+      return 0
+    fi
+    if [ -n "$spawned_pid" ] && ! kill -0 "$spawned_pid" 2>/dev/null; then
+      echo "Server process (PID ${spawned_pid}) exited before becoming healthy; check ${LOG_FILE}" >&2
+      rm -f "$PID_FILE"
+      return 1
+    fi
+    sleep 0.5
+  done
+
+  echo "Server did not respond within 120s; check ${LOG_FILE}" >&2
+  return 1
+}
+
+cmd_stop() {
+  local stopped_any=0
+  if plist_matches_port; then
+    launchctl bootout "${GUI_DOMAIN}/${SERVICE_LABEL}" 2>/dev/null || true
+    stopped_any=1
+  fi
+  if [ -f "$PID_FILE" ] && kill -0 "$(cat "$PID_FILE")" 2>/dev/null; then
+    kill "$(cat "$PID_FILE")" 2>/dev/null || true
+    stopped_any=1
+  fi
+  local port_pid
+  port_pid="$(get_port_pid "$M5_MLX_PORT")"
+  if is_m5_port_pid "$port_pid"; then
+    kill "$port_pid" 2>/dev/null || true
+    stopped_any=1
+  fi
+  local ps_pid
+  ps_pid="$(find_port_server_pid || true)"
+  if [ -n "$ps_pid" ] && kill -0 "$ps_pid" 2>/dev/null; then
+    kill "$ps_pid" 2>/dev/null || true
+    stopped_any=1
+  fi
+  local i
+  for i in $(seq 1 20); do
+    if ! is_server_active; then
+      break
+    fi
+    sleep 0.5
+  done
+  local rem_pid up_pid up_pid2
+  rem_pid="$(get_port_pid "$M5_MLX_PORT")"
+  if is_m5_port_pid "$rem_pid"; then
+    kill -9 "$rem_pid" 2>/dev/null || true
+  fi
+  if [ "$stopped_any" -eq 1 ]; then
+    up_pid="$(get_port_pid "$M5_MLX_UPSTREAM_PORT")"
+    if [ -n "$up_pid" ]; then
+      local up_cmd should_stop_up=0
+      up_cmd="$(ps -p "$up_pid" -o command= 2>/dev/null || true)"
+      case "$up_cmd" in
+        *"${M5_MLX_HOME}"*)
+          should_stop_up=1
+          ;;
+        *omlx*|*llama-server*)
+          if [ "$M5_MLX_PORT" = "8080" ] || [ "$M5_MLX_UPSTREAM_PORT" != "8081" ]; then
+            should_stop_up=1
+          fi
+          ;;
+      esac
+      if [ "$should_stop_up" -eq 1 ]; then
+        kill "$up_pid" 2>/dev/null || true
+        sleep 1
+        up_pid2="$(get_port_pid "$M5_MLX_UPSTREAM_PORT")"
+        [ -n "$up_pid2" ] && kill -9 "$up_pid2" 2>/dev/null || true
+      fi
+    fi
+  fi
+  rm -f "$PID_FILE"
+  echo "Stopped m5-mlx-server."
+}
+
+cmd_switch() {
+  local target="${1:-}"
+  apply_preset "$target"
+  if [ "$M5_MLX_BACKEND" = "omlx" ] && [ ! -e "${M5_MLX_OMLX_MODEL_DIR}/${M5_MLX_MODEL_ID}" ] && [ -d "${M5_MLX_HOME}/models/Inkling-2-Mini-oQ3e-mtp" ]; then
+    mkdir -p "${M5_MLX_OMLX_MODEL_DIR}"
+    ln -sfn "${M5_MLX_HOME}/models/Inkling-2-Mini-oQ3e-mtp" "${M5_MLX_OMLX_MODEL_DIR}/${M5_MLX_MODEL_ID}"
+  fi
+  write_active_profile_env
+  sync_launchagent_plist
+  echo "Switched active profile to ${M5_MLX_PROFILE} (backend=${M5_MLX_BACKEND}, model_id=${M5_MLX_MODEL_ID}, ctx=${M5_MLX_CONTEXT_LENGTH})."
+  if is_server_active; then
+    echo "Restarting running server..."
+    cmd_stop || true
+    sleep 1
+    cmd_start
+  fi
+}
+
+cmd_status() {
+  if [ -f "$PROFILE_ENV" ]; then
+    load_active_profile
+    echo "Active profile: ${M5_MLX_PROFILE:-unknown} (backend=${M5_MLX_BACKEND}, model_id=${M5_MLX_MODEL_ID}, ctx=${M5_MLX_CONTEXT_LENGTH})"
+  else
+    echo "Active profile: default (inkling2, no ${PROFILE_ENV} written yet)"
+  fi
+
+  if curl -sf --max-time 2 "http://127.0.0.1:${M5_MLX_PORT}/health" 2>/dev/null; then
+    echo ""
+    local server_pid
+    server_pid="$(get_port_pid "$M5_MLX_PORT")"
+    if plist_matches_port && launchctl print "${GUI_DOMAIN}/${SERVICE_LABEL}" >/dev/null 2>&1; then
+      echo "LaunchAgent (${SERVICE_LABEL}): ENABLED & ACTIVE (PID ${server_pid:-unknown})"
+    elif plist_matches_port; then
+      echo "LaunchAgent (${SERVICE_LABEL}): INSTALLED (${PLIST_FILE})"
+    else
+      echo "LaunchAgent (${SERVICE_LABEL}): NOT INSTALLED for port ${M5_MLX_PORT} (manual mode, PID ${server_pid:-unknown})"
+    fi
+  else
+    echo "m5-mlx-server is NOT running on port ${M5_MLX_PORT}."
+    return 1
+  fi
+}
+
+cmd_logs() {
+  local lines="${1:-50}"
+  if [ ! -f "$LOG_FILE" ]; then
+    echo "No log file found at ${LOG_FILE}" >&2
+    return 1
+  fi
+  tail -n "$lines" "$LOG_FILE"
+}
+
+cmd_doctor() {
+  local os_name arch mem_bytes mem_gb wired_limit llama_bin
+  os_name="$(uname -s)"
+  arch="$(uname -m)"
+  echo "=== m5-mlx Doctor ==="
+  echo "M5_MLX_HOME: ${M5_MLX_HOME}"
+  echo "REPO_DIR:    ${REPO_DIR}"
+  echo "Ports:       frontend=${M5_MLX_PORT}, upstream=${M5_MLX_UPSTREAM_PORT}"
+
+  if [ "$os_name" = "Darwin" ] && [ "$arch" = "arm64" ]; then
+    echo "[OK]   Platform: ${os_name} ${arch} (Apple Silicon)"
+  else
+    echo "[WARN] Platform: ${os_name} ${arch} (expected Darwin arm64)"
+  fi
+
+  if [ "$os_name" = "Darwin" ]; then
+    mem_bytes="$(sysctl -n hw.memsize 2>/dev/null || echo 0)"
+    mem_gb=$((mem_bytes / 1024 / 1024 / 1024))
+    if [ "$mem_gb" -ge 24 ]; then
+      echo "[OK]   Unified RAM: ${mem_gb} GiB"
+    else
+      echo "[WARN] Unified RAM: ${mem_gb} GiB (< 24 GiB; 35B MoE may swap)"
+    fi
+
+    wired_limit="$(sysctl -n iogpu.wired_limit_mb 2>/dev/null || echo "unavailable")"
+    if [ "$wired_limit" = "unavailable" ]; then
+      echo "[WARN] sysctl iogpu.wired_limit_mb: unavailable"
+    elif [ "$wired_limit" -ge 6144 ] 2>/dev/null; then
+      echo "[OK]   sysctl iogpu.wired_limit_mb=${wired_limit}"
+    else
+      echo "[INFO] sysctl iogpu.wired_limit_mb=${wired_limit} (set >= 6144 for Qwen3.6 3-bit MoE: sudo sysctl iogpu.wired_limit_mb=6144)"
+    fi
+  fi
+
+  if [ -x "$PYTHON_BIN" ]; then
+    echo "[OK]   mlx-env Python: ${PYTHON_BIN}"
+  else
+    echo "[MISS] mlx-env Python: ${PYTHON_BIN}"
+  fi
+
+  if [ -x "${M5_MLX_HOME}/omlx-env/bin/omlx" ]; then
+    echo "[OK]   omlx-env binary: ${M5_MLX_HOME}/omlx-env/bin/omlx"
+  else
+    echo "[MISS] omlx-env binary: ${M5_MLX_HOME}/omlx-env/bin/omlx"
+  fi
+
+  llama_bin="$(resolve_llama_bin)"
+  if [ -x "$llama_bin" ]; then
+    echo "[OK]   llama-server: ${llama_bin}"
+  else
+    echo "[MISS] llama-server: ${llama_bin}"
+  fi
+
+  local model_paths=(
+    "${M5_MLX_HOME}/omlx-models/inkling-2-mini-oq3e-mtp"
+    "${M5_MLX_HOME}/models/Inkling-2-Mini-GGUF/Inkling-2-Mini-UD-Q3_K_XL.gguf"
+    "${M5_MLX_HOME}/models/Qwen3.6-35B-A3B-UD-MLX-3bit"
+    "${M5_MLX_HOME}/models/Qwen3.6-35B-A3B-NVFP4-MLX-3bit-MoE"
+  )
+  local mp
+  for mp in "${model_paths[@]}"; do
+    if [ -e "$mp" ]; then
+      echo "[OK]   Model present: ${mp}"
+    else
+      echo "[MISS] Model absent:  ${mp}"
+    fi
+  done
+
+  if [ -f "$PROFILE_ENV" ]; then
+    echo "[OK]   Active profile file: ${PROFILE_ENV}"
+  else
+    echo "[INFO] Active profile file: not created yet (defaults to inkling2)"
+  fi
+
+  if [ -f "$PLIST_FILE" ]; then
+    echo "[OK]   LaunchAgent plist: ${PLIST_FILE}"
+  else
+    echo "[INFO] LaunchAgent plist: not installed"
+  fi
+}
+
+cmd_install_launchagent() {
+  if [ ! -f "$PLIST_TEMPLATE" ]; then
+    echo "Missing plist template: ${PLIST_TEMPLATE}" >&2
+    return 1
+  fi
+  mkdir -p "$(dirname "$PLIST_FILE")" "$M5_MLX_HOME" "$LOG_DIR"
+
+  local tmp_plist
+  tmp_plist="$(mktemp "$(dirname "$PLIST_FILE")/.com.community.m5-mlx-server.XXXXXX")"
+  sed \
+    -e "s|__M5_MLX_HOME__|${M5_MLX_HOME}|g" \
+    -e "s|__M5_MLX_REPO_DIR__|${REPO_DIR}|g" \
+    -e "s|__M5_MLX_PORT__|${M5_MLX_PORT}|g" \
+    -e "s|__M5_MLX_UPSTREAM_PORT__|${M5_MLX_UPSTREAM_PORT}|g" \
+    "$PLIST_TEMPLATE" > "$tmp_plist"
+  mv -f "$tmp_plist" "$PLIST_FILE"
+
+  load_active_profile
+  sync_launchagent_plist
+  plutil -lint "$PLIST_FILE" >/dev/null
+
+  launchctl bootout "${GUI_DOMAIN}/${SERVICE_LABEL}" 2>/dev/null || true
+  launchctl bootstrap "$GUI_DOMAIN" "$PLIST_FILE" 2>/dev/null || true
+  echo "Installed LaunchAgent at ${PLIST_FILE}"
+}
+
+cmd_uninstall_launchagent() {
+  launchctl bootout "${GUI_DOMAIN}/${SERVICE_LABEL}" 2>/dev/null || true
+  rm -f "$PLIST_FILE"
+  echo "Removed LaunchAgent ${PLIST_FILE}"
+}
+
+case "${1:-}" in
+  start)
+    cmd_start
+    ;;
+  stop)
+    cmd_stop
+    ;;
+  restart)
+    cmd_stop || true
+    sleep 1
+    cmd_start
+    ;;
+  switch)
+    cmd_switch "${2:-}"
+    ;;
+  status)
+    cmd_status
+    ;;
+  logs)
+    cmd_logs "${2:-50}"
+    ;;
+  doctor)
+    cmd_doctor
+    ;;
+  install-launchagent)
+    cmd_install_launchagent
+    ;;
+  uninstall-launchagent)
+    cmd_uninstall_launchagent
+    ;;
+  *)
+    usage
+    exit 1
+    ;;
+esac

@@ -1,0 +1,38 @@
+# Python virtual environments & local runtime envs
+.venv/
+venv/
+*-env/
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+build/
+dist/
+.pytest_cache/
+.ruff_cache/
+
+# Model weights, caches, and local runtime state
+models/
+omlx-models/
+omlx-data/
+omlx-ssd-cache/
+*.gguf
+*.safetensors
+*.bin
+*.npz
+
+# Secrets and environment files
+.env
+.env.*
+
+# Logs, PIDs, locks, and OS artifacts
+logs/
+*.log
+*.pid
+*.lock
+.DS_Store
+
+# Generated LaunchAgent plists (keep templates tracked)
+*.plist
+!*.plist.template

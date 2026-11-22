@@ -1,0 +1,9 @@
+mlx>=0.32.4
+mlx-lm>=0.32.2
+mlx-vlm>=0.7.11
+fastapi>=0.115.0
+uvicorn>=0.32.0
+huggingface_hub>=0.26.0
+transformers>=4.48.0
+numpy
+safetensors

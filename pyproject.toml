@@ -1,0 +1,65 @@
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "apple-m5-localmodel-mlx"
+version = "0.1.0"
+description = "OpenAI-compatible MLX, oMLX, and llama.cpp local LLM server optimized for Apple M5 MacBook Air (24GB unified memory)"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "Apache-2.0" }
+authors = [
+  { name = "Svobikl", email = "Svobikl@users.noreply.github.com" },
+]
+keywords = ["apple-silicon", "m5", "mlx", "omlx", "llama-cpp", "openai-server", "local-llm"]
+classifiers = [
+  "Development Status :: 4 - Beta",
+  "Environment :: MacOS X",
+  "License :: OSI Approved :: Apache Software License",
+  "Operating System :: MacOS :: MacOS X",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+dependencies = [
+  "mlx>=0.32.4",
+  "mlx-lm>=0.32.2",
+  "mlx-vlm>=0.7.11",
+  "fastapi>=0.115.0",
+  "uvicorn>=0.32.0",
+  "huggingface_hub>=0.26.0",
+  "transformers>=4.48.0",
+  "numpy",
+  "safetensors",
+]
+
+[project.urls]
+Homepage = "https://github.com/Svobikl/AppleM5_air_localmodel_optimized_mlx"
+Repository = "https://github.com/Svobikl/AppleM5_air_localmodel_optimized_mlx.git"
+
+# CLI Entrypoints:
+# - Service & model switcher shell CLI: ./bin/m5-mlx-ctl (installed by ./install.sh)
+# - OpenAI-compatible server: python server/m5_mlx_server.py (or `m5-mlx-server`)
+# - Qwen3.6 3-bit MoE builder: python scripts/build_qwen36_3bit_moe.py
+[project.scripts]
+m5-mlx-server = "server.m5_mlx_server:main"
+
+[tool.setuptools]
+py-modules = []
+
+[tool.setuptools.packages.find]
+include = ["server*"]
+exclude = ["launchd*", "tests*", "scripts*", "bin*"]
+
+[tool.ruff]
+target-version = "py311"
+line-length = 110
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "W"]
+
+[tool.unittest]
+start-directory = "tests"
+pattern = "test_*.py"
